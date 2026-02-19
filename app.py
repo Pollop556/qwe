@@ -2,66 +2,67 @@ import pandas as pd
 from transformers import GPT2LMHeadModel, GPT2Tokenizer, TextDataset, DataCollatorForLanguageModeling
 from transformers import Trainer, TrainingArguments
 
-def train():
-    # 1. Загрузка модели и токенизатора
-    # Используем sberbank-ai/rugpt3small_based_on_gpt2, она лучше всего подходит для таких задач
+def train_model():
+    # 1. Настройка модели и токенизатора
     model_name = "sberbank-ai/rugpt3small_based_on_gpt2"
     tokenizer = GPT2Tokenizer.from_pretrained(model_name)
     model = GPT2LMHeadModel.from_pretrained(model_name)
 
-    # 2. Подготовка данных
-    # Мы склеиваем input и target специальным разделителем <|endoftext|>, 
-    # чтобы модель понимала, где заканчиваются данные и начинается характеристика
-    df = pd.read_csv("dataset.csv")
-    train_text = ""
-    for _, row in df.iterrows():
-        train_text += f"{row['input']} {row['target']} {tokenizer.eos_token}\n"
-    
-    with open("train_data.txt", "w", encoding="utf-8") as f:
-        f.write(train_text)
+    # Добавляем специальные токены, чтобы модель понимала, где вход, а где ответ
+    special_tokens = {'bos_token': '<bos>', 'eos_token': '<eos>', 'pad_token': '<pad>'}
+    tokenizer.add_special_tokens(special_tokens)
+    model.resize_token_embeddings(len(tokenizer))
 
-    # Создание датасета
-    dataset = TextDataset(
+    # 2. Подготовка данных
+    # Мы преобразуем CSV в текстовый формат, который понимает GPT
+    def prepare_data(file_path):
+        df = pd.read_csv(file_path)
+        with open("train_text.txt", "w", encoding="utf-8") as f:
+            for _, row in df.iterrows():
+                # Формат: <bos> Ввод <sep> Результат <eos>
+                combined_text = f"<bos>{row['input']}\nХарактеристика: {row['target']}<eos>\n"
+                f.write(combined_text)
+
+    print("Подготовка данных...")
+    prepare_data('shuffled_dataset.csv')
+
+    # 3. Создание датасета для обучения
+    train_dataset = TextDataset(
         tokenizer=tokenizer,
-        file_path="train_data.txt",
-        block_size=256 # Оптимально для характеристик средней длины
+        file_path="train_text.txt",
+        block_size=128
     )
 
     data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
 
-    # 3. Улучшенные параметры обучения
+    # 4. Настройка параметров обучения
     training_args = TrainingArguments(
-        output_dir="./rugpt3_student_model",
+        output_dir="./results",          # папка для промежуточных данных
         overwrite_output_dir=True,
-        num_train_epochs=15,          # Увеличили до 15 для глубокого усвоения 167 примеров
-        per_device_train_batch_size=4, # Оптимально для памяти Colab
-        save_steps=500,
-        save_total_limit=2,
-        
-        # Продвинутые параметры:
-        learning_rate=5e-5,           # Чуть ниже стандартного для мягкого дообучения
-        weight_decay=0.01,            # Регуляризация, чтобы модель не "зубрила" ФИО
-        warmup_steps=100,             # Плавный вход в обучение
-        lr_scheduler_type="cosine",   # Постепенное снижение скорости обучения к концу
-        logging_steps=10,
-        fp16=True,                    # Включаем ускорение на GPU (в Colab должно быть активно)
+        num_train_epochs=10,             # количество проходов по датасету
+        per_device_train_batch_size=4,   # размер батча (зависит от памяти видеокарты)
+        save_steps=500,                  # сохранять чекпоинт каждые 500 шагов
+        save_total_limit=2,              # хранить только 2 последних чекпоинта
+        learning_rate=5e-5,              # скорость обучения
+        warmup_steps=100,                # плавный вход в обучение
+        logging_dir='./logs',            # папка для логов
     )
 
-    # 4. Запуск тренера
+    # 5. Запуск обучения
     trainer = Trainer(
         model=model,
         args=training_args,
         data_collator=data_collator,
-        train_dataset=dataset,
+        train_dataset=train_dataset,
     )
 
-    print("Начинаю обучение на 167 примерах...")
+    print("Начало обучения... Это может занять время.")
     trainer.train()
-    
-    # Сохранение финальной версии
+
+    # 6. Сохранение финальной модели
     model.save_pretrained("./final_model")
     tokenizer.save_pretrained("./final_model")
-    print("Обучение завершено! Модель сохранена в папку final_model")
+    print("Обучение завершено! Модель сохранена в папку 'final_model'.")
 
 if __name__ == "__main__":
-    train()
+    train_model()
