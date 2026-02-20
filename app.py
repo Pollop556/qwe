@@ -1,78 +1,120 @@
 import torch
-import pandas as pd
+from unsloth import FastLanguageModel
 from datasets import Dataset
-from transformers import (
-    AutoModelForCausalLM, 
-    AutoTokenizer, 
-    TrainingArguments, 
-    Trainer, 
-    DataCollatorForLanguageModeling
-)
+import pandas as pd
+from trl import SFTTrainer
+from transformers import TrainingArguments
 
 def train():
-    model_name = "Vikhrmodels/Vikhr-Llama-3.2-1B-instruct"
+    # 1. 🚀 Конфигурация модели
+    # Используем Qwen 2.5 3B Instruct — лучшая модель для русского языка в этом классе
+    model_name = "Qwen/Qwen2.5-3B-Instruct" 
     
-    # 1. Загрузка токенизатора и модели
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    tokenizer.pad_token = tokenizer.eos_token
-    tokenizer.padding_side = "right" # Важно для Llama
+    # Максимальная длина контекста. 2048 токенов достаточно для одной характеристики (обычно ~500-1000 слов).
+    # Если характеристики очень длинные, можно увеличить до 4096, но это займет больше памяти.
+    max_seq_length = 2048 
+    
+    dtype = None # Автоматическое определение (float16 для T4)
+    load_in_4bit = True # Обязательно True для T4 (16GB), иначе модель не влезет или будет медленной
 
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        device_map="auto",
-        torch_dtype=torch.float16 # Оптимально для T4 GPU в Colab
+    print(f"🚀 Загрузка модели {model_name}...")
+    model, tokenizer = FastLanguageModel.from_pretrained(
+        model_name = model_name,
+        max_seq_length = max_seq_length,
+        dtype = dtype,
+        load_in_4bit = load_in_4bit,
     )
 
-    # 2. Подготовка датасета (Идеальный промпт)
+    # 2. ⚡ Настройка LoRA адаптеров (оптимизация под Qwen)
+    # Qwen имеет специфичные модули (q,k,v,o,gate,up,down), мы обучаем их все для лучшего качества.
+    model = FastLanguageModel.get_peft_model(
+        model,
+        r = 16, # Ранг адаптера. 16 — золотая середина (можно 32 или 64, но 16 быстрее и памяти меньше)
+        target_modules = ["q_proj", "k_proj", "v_proj", "o_proj",
+                          "gate_proj", "up_proj", "down_proj",],
+        lora_alpha = 16, # Alpha = r (стандартная практика)
+        lora_dropout = 0, # 0 для скорости
+        bias = "none",    # "none" для скорости и памяти
+        use_gradient_checkpointing = "unsloth", # Критично для экономии VRAM
+        random_state = 3407,
+        use_rslora = False,
+        loftq_config = None,
+    )
+
+    # 3. 📂 Подготовка датасета
+    print("📂 Загрузка и подготовка датасета...")
     df = pd.read_csv('shuffled_dataset.csv')
+    dataset = Dataset.from_pandas(df)
 
-    def format_chat(example):
-        # Используем официальный формат Llama-3 для инструкций
-        messages = [
-            {"role": "system", "content": "Ты — эксперт-куратор. Пишешь профессиональные характеристики студентов по заданным параметрам. Используй официально-деловой стиль."},
-            {"role": "user", "content": f"Сформируй характеристику: {example['input']}"},
-            {"role": "assistant", "content": example['target']}
-        ]
-        return {"text": tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)}
+    # Форматирование под Qwen Chat Template
+    def formatting_prompts_func(examples):
+        texts = []
+        for input_text, output_text in zip(examples["input"], examples["target"]):
+            messages = [
+                # Системный промпт — задает роль и стиль.
+                {"role": "system", "content": "Ты — профессиональный педагог-куратор. Твоя задача — составлять подробные, объективные и педагогически грамотные характеристики на студентов. Стиль изложения: официально-деловой, сдержанный, но содержательный."},
+                
+                # Входные данные от пользователя
+                {"role": "user", "content": f"Составь характеристику на студента по следующим данным: {input_text}"},
+                
+                # Эталонный ответ (то, чему учим модель)
+                {"role": "assistant", "content": output_text}
+            ]
+            
+            # apply_chat_template сам добавит специальные токены <|im_start|> и <|im_end|> для Qwen
+            text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
+            texts.append(text)
+        return { "text" : texts, }
 
-    dataset = Dataset.from_pandas(df).map(format_chat)
+    dataset = dataset.map(formatting_prompts_func, batched = True,)
 
-    def tokenize_func(examples):
-        return tokenizer(examples["text"], truncation=True, max_length=384, padding="max_length")
-
-    tokenized_dataset = dataset.map(tokenize_func, batched=True, remove_columns=dataset.column_names)
-
-    # 3. Идеальные параметры обучения для 1B модели
-    training_args = TrainingArguments(
-        output_dir="./vikhr_results",
-        num_train_epochs=3,              # 3 эпохи — "золотой стандарт"
-        per_device_train_batch_size=2,   # Чтобы не вылететь по памяти
-        gradient_accumulation_steps=8,   # Эффективный батч = 16 (2*8)
-        learning_rate=2e-5,              # Мягкое обучение
-        lr_scheduler_type="cosine",      # Плавное затухание
-        warmup_ratio=0.1,                # 10% времени на разогрев
-        weight_decay=0.05,               # Профилактика переобучения
-        logging_steps=5,
-        save_strategy="no",
-        fp16=True,                       # Ускорение на GPU
-        gradient_checkpointing=True,     # Максимальная экономия VRAM
-        report_to="none"
+    # 4. 🔥 Гиперпараметры обучения (Training Arguments)
+    # Оптимизировано под dataset ~500 примеров и модель 3B
+    print("🔥 Начинаем обучение...")
+    trainer = SFTTrainer(
+        model = model,
+        tokenizer = tokenizer,
+        train_dataset = dataset,
+        dataset_text_field = "text",
+        max_seq_length = max_seq_length,
+        dataset_num_proc = 2,
+        packing = False, 
+        args = TrainingArguments(
+            per_device_train_batch_size = 2,   # Батч 2 на карту (влезает в 16GB)
+            gradient_accumulation_steps = 4,   # Эффективный батч = 2 * 4 = 8
+            warmup_steps = 10,                 # Разогрев (чуть больше для стабилизации)
+            num_train_epochs = 3,              # 3 эпохи обычно идеально для ~500 примеров. 
+                                               # Если 1 эпоха, модель недоучится. Если 10 — переучится (зазубрит).
+            learning_rate = 2e-4,              # Стандартный LR для QLoRA
+            fp16 = not torch.cuda.is_bf16_supported(),
+            bf16 = torch.cuda.is_bf16_supported(),
+            logging_steps = 1,
+            optim = "adamw_8bit",              # 8-битный оптимизатор экономит память
+            weight_decay = 0.01,
+            lr_scheduler_type = "linear",
+            seed = 3407,
+            output_dir = "outputs",
+            report_to = "none", # Отключаем wandb чтобы не логиниться лишний раз
+        ),
     )
 
-    trainer = Trainer(
-        model=model,
-        args=training_args,
-        train_dataset=tokenized_dataset,
-        data_collator=DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
-    )
-
-    print("🚀 Запуск идеального обучения Vikhr-1B...")
     trainer.train()
+
+    # 5. 💾 Сохранение и экспорт
+    print("✅ Обучение завершено!")
     
-    # Сохранение
-    model.save_pretrained("./final_vikhr_model")
-    tokenizer.save_pretrained("./final_vikhr_model")
-    print("✅ Готово! Модель в папке ./final_vikhr_model")
+    # Сохраняем адаптеры
+    model.save_pretrained("lora_model") 
+    tokenizer.save_pretrained("lora_model")
+
+    # Экспорт в GGUF для запуска на ноутбуке
+    # Используем q4_k_m — лучший баланс скорости и качества для 3B моделей
+    print("📦 Экспорт в GGUF (q4_k_m)...")
+    try:
+        model.save_pretrained_gguf("model_gguf", tokenizer, quantization_method = "q4_k_m")
+        print("🎉 УСПЕХ! Файл GGUF сохранен в папку 'model_gguf'. Скачай его!")
+    except Exception as e:
+        print(f"❌ Ошибка экспорта GGUF: {e}")
 
 if __name__ == "__main__":
     train()
